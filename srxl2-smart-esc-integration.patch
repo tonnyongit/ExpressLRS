@@ -1,0 +1,203 @@
+--- a/src/include/common.h
++++ b/src/include/common.h
+@@ -202,7 +202,7 @@
+     somSerial,      // 10:  primary Serial
+     somSCL,         // 11: I2C clock signal
+     somSDA,         // 12: I2C data line
+-    somPwm,         // 13: true PWM mode (NOT SUPPORTED)
++    somSRXL2,       // 13: single-wire SRXL2 SMART ESC (ESP32 PWM receivers)
+     somSerial1RX,   // 14: secondary Serial RX
+     somSerial1TX,   // 15: secondary Serial TX
+ };
+--- a/src/lib/rx-crsf/RXParameters.cpp
++++ b/src/lib/rx-crsf/RXParameters.cpp
+@@ -9,6 +9,9 @@
+ #include "helpers.h"
+ #include "rxtx_intf.h"
+ #include "logging.h"
++#if defined(PLATFORM_ESP32)
++#include <soc/soc_caps.h>
++#endif
+ 
+ #define RX_HAS_SERIAL1 (GPIO_PIN_SERIAL1_TX != UNDEF_PIN || OPT_HAS_SERVO_OUTPUT)
+ 
+@@ -30,7 +33,7 @@
+ char strPowerLevels[] = "10;25;50;100;250;500;1000;2000;MatchTX ";
+ #endif
+ static char modelString[] = "000";
+-static char pwmModes[] = "50Hz;60Hz;100Hz;160Hz;333Hz;400Hz;10kHzDuty;On/Off;DShot;DShot 3D;Serial RX;Serial TX;I2C SCL;I2C SDA;Serial2 RX;Serial2 TX";
++static char pwmModes[] = "50Hz;60Hz;100Hz;160Hz;333Hz;400Hz;10kHzDuty;On/Off;DShot;DShot 3D;Serial RX;Serial TX;I2C SCL;I2C SDA;SRXL2 SMART ESC;Serial2 RX;Serial2 TX";
+ 
+ static selectionParameter luaSerialProtocol = {
+     {"Protocol", CRSF_TEXT_SELECTION},
+@@ -203,7 +206,7 @@
+ 
+ static uint8_t sanitizePwmMode(uint8_t mode)
+ {
+-    return OPT_PWM_OUT_ONLY && mode >= somSerial ? som50Hz : mode;
++    return OPT_PWM_OUT_ONLY && mode >= somSerial && mode != somSRXL2 ? som50Hz : mode;
+ }
+ 
+ void RXEndpoint::luaparamMappingChannelOut(propertiesCommon *item, uint8_t arg)
+@@ -213,6 +216,7 @@
+ #if defined(PLATFORM_ESP32)
+     bool serial1rxAssigned = false;
+     bool serial1txAssigned = false;
++    bool srxl2Assigned = false;
+ #endif
+ 
+     const char *no1Option    = ";";
+@@ -227,6 +231,7 @@
+     const char *serial1_TX   = ";;Serial2 TX";
+     const char *serial1_BOTH = ";Serial2 RX;Serial2 TX";
+     const char *dshot        = ";DShot;DShot 3D";
++    const char *srxl2         = ";SRXL2 SMART ESC";
+ #endif
+ 
+     const char *pModeString;
+@@ -252,6 +257,9 @@
+ 
+       if (mode == somSerial1TX)
+         serial1txAssigned = true;
++
++      if (mode == somSRXL2)
++        srxl2Assigned = true;
+ #endif
+     }
+ 
+@@ -335,8 +343,13 @@
+     }
+     strcat(pwmModes, pModeString);
+ 
+-    // nothing to do for unsupported somPwm mode
++#if defined(PLATFORM_ESP32) && SOC_UART_NUM > 2
++    // A receiver has one SRXL2 master bus. Keep the mode selectable on the
++    // currently configured pin, but prevent assigning it to a second output.
++    strcat(pwmModes, srxl2Assigned ? no1Option : srxl2);
++#else
+     strcat(pwmModes, no1Option);
++#endif
+ 
+ #if defined(PLATFORM_ESP32)
+     // secondary Serial pins (2 options)
+--- a/src/html/src/pages/connections-panel.js
++++ b/src/html/src/pages/connections-panel.js
+@@ -5,6 +5,7 @@
+ import {postWithFeedback} from "../utils/feedback.js"
+ 
+ export const PWM_MODE_SERIAL = 10
++export const PWM_MODE_SRXL2 = 13
+ export const PWM_MODE_SERIAL2RX = 14
+ export const PWM_MODE_SERIAL2TX = 15
+ 
+@@ -83,12 +84,13 @@
+                         <li><b>Features:</b> If an output is capable of supporting another function, that is indicated
+                             here
+                         </li>
+-                        <li><b>Mode:</b> Output frequency, 10KHz 0-100% duty cycle, binary On/Off, DShot, Serial, or I2C
++                        <li><b>Mode:</b> Output frequency, 10KHz 0-100% duty cycle, binary On/Off, DShot, SRXL2 SMART ESC, Serial, or I2C
+                             (some options are pin dependant)
+                             <ul>
+                                 <li>When enabling serial pins, be sure to select the <b>Serial Protocol</b> below and <b>UART
+                                     baud</b> on the <b><a href="#serial">Serial</a></b> page in the menu
+                                 </li>
++                                <li><b>SRXL2 SMART ESC</b> replaces PWM on one output with a single-wire throttle and telemetry bus. Only one SRXL2 output can be active.</li>
+                             </ul>
+                         </li>
+                         <li><b>Input:</b> Input channel from the handset</li>
+@@ -187,7 +189,7 @@
+             }
+             modes.push(features & 4 ? 'I2C SCL' : undefined)
+             modes.push(features & 8 ? 'I2C SDA' : undefined)
+-            modes.push(undefined)  // true PWM (not yet supported)
++            modes.push(features & 128 ? 'SRXL2 SMART ESC' : undefined)
+             modes.push(features & 32 ? 'Serial2 RX' : undefined)
+             modes.push(features & 64 ? 'Serial2 TX' : undefined)
+             const selectedMode = modes[mode] ? mode : 0
+@@ -221,11 +223,27 @@
+             _(`pwm_${index}_fsmode`).disabled = onoff
+         }
+ 
+-        // disable extra fields for serial & i2c pins
+-        setDisabled(index, Number.parseInt(pinMode.value) >= PWM_MODE_SERIAL)
++        const modeValue = Number.parseInt(pinMode.value)
++        const isSrxl2 = modeValue === PWM_MODE_SRXL2
++
++        // Serial and I2C pins do not consume an input channel. SRXL2 does: the
++        // selected input is transmitted as throttle on the SMART ESC bus.
++        setDisabled(index, modeValue >= PWM_MODE_SERIAL && !isSrxl2)
++
++        if (isSrxl2) {
++            // Motor failsafe is deliberately fixed to a low output position.
++            _(`pwm_${index}_inv`).checked = false
++            _(`pwm_${index}_inv`).disabled = true
++            _(`pwm_${index}_stretch`).checked = false
++            _(`pwm_${index}_stretch`).disabled = true
++            _(`pwm_${index}_fsmode`).value = '0'
++            _(`pwm_${index}_fsmode`).disabled = true
++            _(`pwm_${index}_fs`).value = 988
++            _(`pwm_${index}_fs`).disabled = true
++        }
+ 
+         const updateOthers = (value, enable) => {
+-            if (value > PWM_MODE_SERIAL) { // disable others
++            if (value > PWM_MODE_SERIAL) { // single-instance peripheral modes
+                 elrsState.config.pwm.forEach((item, other) => {
+                     if (other !== index) {
+                         document.querySelectorAll(`#pwm_${other}_mode option`).forEach(opt => {
+@@ -277,9 +295,13 @@
+ 
+     _failsafeModeChange(failsafeMode, index) {
+         const mode = _(`pwm_${index}_mode`).value
+-        if (mode < PWM_MODE_SERIAL) {
++        if (mode < PWM_MODE_SERIAL || Number.parseInt(mode) === PWM_MODE_SRXL2) {
+             const failsafeField = _(`pwm_${index}_fs`)
+-            if (failsafeMode.value === '0') {
++            if (Number.parseInt(mode) === PWM_MODE_SRXL2) {
++                failsafeField.value = 988
++                failsafeField.disabled = true
++                failsafeField.style.display = 'block'
++            } else if (failsafeMode.value === '0') {
+                 failsafeField.disabled = false
+                 failsafeField.style.display = 'block'
+             } else {
+--- a/src/lib/WIFI/devWIFI.cpp
++++ b/src/lib/WIFI/devWIFI.cpp
+@@ -14,6 +14,7 @@
+ #include <esp_partition.h>
+ #include <esp_ota_ops.h>
+ #include <soc/uart_pins.h>
++#include <soc/soc_caps.h>
+ #else
+ #include <ESP8266WiFi.h>
+ #include <ESP8266mDNS.h>
+@@ -477,6 +478,9 @@
+       }
+       #if defined(PLATFORM_ESP32)
+       if (pin != 0) features |= 16; // DShot supported on all pins but GPIO0
++      #if SOC_UART_NUM > 2
++      features |= 128; // SRXL2 SMART ESC supported through dedicated UART2
++      #endif
+       if (!OPT_PWM_OUT_ONLY)
+       {
+         if (pin == GPIO_PIN_SERIAL1_RX) features |= 32;  // SERIAL1 RX supported (only on this pin)
+--- a/src/src/rx_main.cpp
++++ b/src/src/rx_main.cpp
+@@ -34,6 +34,7 @@
+ #include "devLED.h"
+ #include "devRXLUA.h"
+ #include "devServoOutput.h"
++#include "devSRXL2SmartEsc.h"
+ #include "devWIFI.h"
+ #include "RXEndpoint.h"
+ #include "RXOTAConnector.h"
+@@ -86,6 +87,9 @@
+   {&Button_device, 0},
+   {&AnalogVbat_device, 0},
+   {&ServoOut_device, 1},
++#if defined(PLATFORM_ESP32)
++  {&SRXL2SmartEsc_device, 0},
++#endif
+   {&Baro_device, 0}, // must come after AnalogVbat_device to slow updates
+ #if defined(PLATFORM_ESP32) && !defined(PLATFORM_ESP32_C3)
+   {&VTxSPI_device, 0}, // dependency on VTxSPI_device
